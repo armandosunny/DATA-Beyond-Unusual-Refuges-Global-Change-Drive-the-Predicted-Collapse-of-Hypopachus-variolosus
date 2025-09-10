@@ -1,0 +1,264 @@
+# =========================================================
+# Hypopachus variolosus: ENM × Human Footprint × Hotspots
+# Reproducible pipeline (terra / ggplot2 / sf / rmapshaper)
+# Autor: A. Sunny (compilado para GitHub)
+# =========================================================
+
+# ---------- 0) Paquetes ----------
+install_if_missing <- function(pkgs){
+  to_inst <- pkgs[!pkgs %in% installed.packages()[,1]]
+  if(length(to_inst)) install.packages(to_inst, quiet = TRUE)
+}
+pkgs <- c("terra","ggplot2","viridis","sf","rmapshaper","zip")
+install_if_missing(pkgs)
+library(terra)
+library(ggplot2)
+library(viridis)
+library(sf)
+library(rmapshaper)
+
+# ---------- 1) Rutas de trabajo e insumos ----------
+# Cambia esto a tu carpeta del proyecto
+# setwd("C:/Users/.../tu_proyecto")
+dir.create("outputs", showWarnings = FALSE)
+
+# Archivos de entrada (ajusta nombres si difieren)
+f_hfp   <- "hf_mexico_wgs84.tif"                                  # Human Footprint (0–50, WGS84)
+f_enm   <- "proj_Current_Hypopachus.variolosus_ensemble.tif"      # ENM continuo 0–1000
+f_aoi   <- "peninsulayucatan.shp"                                 # Shapefile AOI (Yucatán) p/GFW
+
+stopifnot(file.exists(f_hfp), file.exists(f_enm))  # AOI es opcional
+
+# ---------- 2) Cargar y alinear ----------
+hf  <- rast(f_hfp)
+enm <- rast(f_enm); if(nlyr(enm) > 1) enm <- enm[[1]]
+
+# Alinear CRS / resolución / extensión (idempotente)
+if (!isTRUE(crs(hf) == crs(enm))) hf <- project(hf, enm, method = "bilinear")
+if (!isTRUE(all.equal(res(hf), res(enm)))) hf <- resample(hf, enm, method = "bilinear")
+if (!isTRUE(all.equal(ext(hf), ext(enm)))) {
+  common_ext <- intersect(ext(hf), ext(enm))
+  hf  <- crop(hf,  common_ext)
+  enm <- crop(enm, common_ext)
+}
+# Limpieza mutua de NAs
+hf  <- mask(hf,  !is.na(enm))
+enm <- mask(enm, !is.na(hf))
+
+# ---------- 3) Presencia (umbral 700) y métricas básicas ----------
+thr <- 700
+pres_bin <- enm >= thr                      # 0/1
+hf_in_pres <- mask(hf, pres_bin, maskvalues = 0)
+
+# Área por celda (km2)
+cell_km2 <- cellSize(hf_in_pres, unit = "km")
+# Área de presencia
+presence_area_km2 <- as.numeric(global(cell_km2, "sum", na.rm = TRUE))
+
+# HFP medio ponderado por idoneidad continua
+num <- as.numeric(global(hf * enm, "sum", na.rm = TRUE))
+den <- as.numeric(global(enm, "sum", na.rm = TRUE))
+hfp_weighted_mean <- num / den
+
+# ---------- 4) HFP por CLASES FIJAS y Pareto ----------
+brks_fix <- c(-Inf,10,20,30,40,50,Inf)
+labs_fix <- c("0–10","10–20","20–30","30–40","40–50","50+")
+rcl_fix  <- cbind(brks_fix[-length(brks_fix)], brks_fix[-1], 1:length(labs_fix))
+hfp_class <- classify(hf_in_pres, rcl = rcl_fix) |> as.factor()
+lev <- levels(hfp_class)[[1]]
+lev$class <- labs_fix[match(lev$ID, 1:length(labs_fix))]
+levels(hfp_class) <- lev
+
+# Zonal área por clase
+cell_km2 <- mask(cell_km2, pres_bin, maskvalues = 0)
+area_fix <- zonal(cell_km2, hfp_class, "sum", na.rm = TRUE)
+names(area_fix) <- c("class_id","area_km2")
+lut <- lev[,c("ID","class")]; names(lut) <- c("class_id","class")
+area_fix <- merge(area_fix, lut, by="class_id")[,c("class","area_km2")]
+area_fix <- area_fix[order(match(area_fix$class, labs_fix)),]
+area_fix$perc <- 100 * area_fix$area_km2 / sum(area_fix$area_km2, na.rm = TRUE)
+write.csv(area_fix, file.path("outputs","area_by_HFP_fixed_classes_thr700.csv"), row.names = FALSE)
+
+# Gráfica barras + porcentajes
+df_bar <- area_fix
+df_bar$class <- factor(df_bar$class, levels = labs_fix)
+p_fixed <- ggplot(df_bar, aes(class, area_km2, fill = class)) +
+  geom_col(width=.85, color="black", linewidth=.25) +
+  geom_text(aes(label=paste0(sprintf("%.1f", perc),"%")), vjust=-.4, size=3.3) +
+  scale_fill_viridis(discrete=TRUE, option="C") +
+  labs(title="Distribution area by fixed Human Footprint classes",
+       subtitle="Within suitability ≥ 700", x="HFP classes", y="Area (km²)") +
+  theme_minimal(base_size=13) + theme(legend.position="none",
+       axis.text.x = element_text(angle=35, hjust=1))
+ggsave(file.path("outputs","F_fixedclasses_bar_area_thr700.png"), p_fixed, width=9, height=5.5, dpi=400)
+
+# Pareto (porcentaje y acumulada)
+df_par <- df_bar; df_par$cum_perc <- cumsum(df_par$perc)
+p_pareto <- ggplot(df_par, aes(class)) +
+  geom_col(aes(y=perc, fill=class), width=.85, color="black", linewidth=.25) +
+  geom_point(aes(y=cum_perc/100 * max(perc)), size=2) +
+  geom_line(aes(y=cum_perc/100 * max(perc), group=1), linewidth=.8) +
+  scale_fill_viridis(discrete=TRUE, option="C") +
+  labs(title="Share of distribution by fixed HFP classes",
+       subtitle="Bars = % by class; Line = cumulative %",
+       x="HFP classes", y="Percentage of area (%)") +
+  theme_minimal(base_size=13) + theme(legend.position="none",
+       axis.text.x = element_text(angle=35, hjust=1))
+ggsave(file.path("outputs","F_fixedclasses_percent_pareto_thr700.png"), p_pareto, width=9, height=5.5, dpi=400)
+
+# Versión 3 niveles (Low/Medium/High)
+cuts3 <- c(-Inf,20,40,Inf)
+labs3 <- c("Low (HFP < 20)","Medium (20 ≤ HFP < 40)","High (HFP ≥ 40)")
+rcl3 <- cbind(cuts3[-length(cuts3)], cuts3[-1], 1:3)
+hfp3 <- classify(hf_in_pres, rcl=rcl3) |> as.factor()
+lev3 <- levels(hfp3)[[1]]; lev3$class <- labs3[lev3$ID]; levels(hfp3) <- lev3
+area3 <- zonal(cell_km2, hfp3, "sum", na.rm=TRUE); names(area3) <- c("id","area_km2")
+lut3 <- lev3[,c("ID","class")]; names(lut3) <- c("id","class")
+area3 <- merge(area3, lut3, by="id")[,c("class","area_km2")]
+area3$perc <- 100 * area3$area_km2 / sum(area3$area_km2)
+write.csv(area3, file.path("outputs","area_by_HFP_3levels_thr700.csv"), row.names=FALSE)
+
+p_3 <- ggplot(area3, aes(x=factor(class, levels=labs3), y=area_km2, fill=class)) +
+  geom_col(width=.7, color="black", linewidth=.25) +
+  geom_text(aes(label=paste0(sprintf("%.1f", perc),"%")), vjust=-.4, size=3.5) +
+  scale_fill_viridis(discrete=TRUE, option="C") +
+  labs(title="Distribution area by human pressure level",
+       subtitle="Within suitability ≥ 700", x=NULL, y="Area (km²)") +
+  theme_minimal(base_size=13) + theme(legend.position="none")
+ggsave(file.path("outputs","F_fixedclasses_bar_3levels_thr700.png"), p_3, width=7.2, height=5, dpi=400)
+
+# ---------- 5) Deciles de HFP + boxplot presencia/ausencia ----------
+v_pres <- values(hf_in_pres, mat=FALSE); v_pres <- v_pres[!is.na(v_pres)]
+stopifnot(length(v_pres) > 0)
+
+qs <- quantile(v_pres, probs = seq(0,1,0.1), na.rm=TRUE)
+brks_dec <- unique(as.numeric(qs)); brks_dec[1] <- -Inf; brks_dec[length(brks_dec)] <- Inf
+rcl_dec <- cbind(brks_dec[-length(brks_dec)], brks_dec[-1], 1:(length(brks_dec)-1))
+labs_dec <- paste0("D", sprintf("%02d",1:(length(brks_dec)-1)),
+                   " [", round(head(qs,-1),2),"–", round(tail(qs,-1),2),"]")
+hfp_dec <- classify(hf_in_pres, rcl_dec) |> as.factor()
+levd <- levels(hfp_dec)[[1]]; le vd <- le vd # (placeholder to avoid accidental editing)
+levd$class <- labs_dec[levd$ID]; levels(hfp_dec) <- levd
+
+area_dec <- zonal(cell_km2, hfp_dec, "sum", na.rm=TRUE)
+names(area_dec) <- c("class_id","area_km2")
+lutd <- levd[,c("ID","class")]; names(lutd) <- c("class_id","class")
+area_dec <- merge(area_dec, lutd, by="class_id")[,c("class_id","class","area_km2")]
+area_dec <- area_dec[order(area_dec$class_id),]
+write.csv(area_dec, file.path("outputs","area_by_HFP_deciles_thr700.csv"), row.names=FALSE)
+
+# Barras por decil
+df_dec <- area_dec; df_dec$class <- factor(df_dec$class, levels=df_dec$class)
+p_dec <- ggplot(df_dec, aes(class, area_km2, fill=class)) +
+  geom_col(width=.85, color="black", linewidth=.25) +
+  labs(title="Distribution area by Human Footprint deciles",
+       subtitle="Within suitability ≥ 700", x="HFP deciles (D01–D10)", y="Area (km²)") +
+  theme_minimal(base_size=12) + theme(legend.position="none",
+       axis.text.x = element_text(angle=45, hjust=1)) +
+  scale_fill_viridis(discrete=TRUE, option="C")
+ggsave(file.path("outputs","F_deciles_bar_thr700.png"), p_dec, width=10, height=6, dpi=350)
+
+# Boxplot HFP presencia vs ausencia (submuestreo para graficar)
+hf_abs <- mask(hf, pres_bin, maskvalues=1, inverse=TRUE)
+v_abs <- values(hf_abs, mat=FALSE); v_abs <- v_abs[!is.na(v_abs)]
+set.seed(123)
+s_pres <- if(length(v_pres) > 1e5) sample(v_pres, 1e5) else v_pres
+s_abs  <- if(length(v_abs)  > 1e5) sample(v_abs,  1e5) else v_abs
+df_box <- rbind(data.frame(group="Presence (≥700)", HFP=s_pres),
+                data.frame(group="Absence",          HFP=s_abs))
+p_box <- ggplot(df_box, aes(group, HFP, fill=group)) +
+  geom_boxplot(outlier.alpha=.2) +
+  labs(title="Human Footprint inside vs. outside presence",
+       subtitle="Presence defined as suitability ≥ 700", x=NULL, y="HFP") +
+  theme_minimal(base_size=12) + theme(legend.position="none") +
+  scale_fill_viridis(discrete=TRUE, option="C")
+ggsave(file.path("outputs","F_boxplot_HFP_presence_vs_absence.png"), p_box, width=8, height=5, dpi=350)
+
+# ---------- 6) Hotspots: PRIORIDAD de conservación ----------
+# A) Regla fija: Presencia ∩ HFP ≥ 40
+prior_fixed <- (pres_bin == 1) & (hf >= 40)
+writeRaster(prior_fixed, file.path("outputs","PRIORITY_fixed_presence700_HFP40.tif"), overwrite=TRUE)
+
+# Vectorizar (disolver) si hay celdas
+n_sel <- as.numeric(global(prior_fixed, "sum", na.rm=TRUE))
+if(!is.na(n_sel) && n_sel > 0){
+  poly <- as.polygons(prior_fixed, dissolve=TRUE, values=TRUE, na.out=TRUE)
+  vcol <- names(poly)[1]
+  poly <- poly[ poly[[vcol]] == 1, ]
+  if(nrow(poly) > 0){
+    poly <- makeValid(poly)
+    poly <- aggregate(poly)
+    writeVector(poly, file.path("outputs","PRIORITY_fixed_presence700_HFP40.gpkg"), overwrite=TRUE)
+  }
+}
+
+# B) Índice continuo: suit_norm × hfp_norm (solo dentro de presencia)
+suit_norm <- clamp(enm/1000, 0, 1)
+hfp_norm  <- clamp(hf/50,    0, 1)
+prior_idx <- mask(suit_norm * hfp_norm, pres_bin, maskvalues=0)
+writeRaster(prior_idx, file.path("outputs","PRIORITY_index_presence700.tif"), overwrite=TRUE)
+
+# Clases por cuantiles (P50/P75/P90)
+vp <- values(prior_idx, mat=FALSE); vp <- vp[!is.na(vp)]
+qs2 <- quantile(vp, probs=c(.50,.75,.90), na.rm=TRUE)
+cls <- classify(prior_idx, rcl=rbind(
+  c(-Inf, qs2[1], 0),
+  c(qs2[1], qs2[2], 1),
+  c(qs2[2], qs2[3], 2),
+  c(qs2[3], Inf,    3)
+))
+writeRaster(cls, file.path("outputs","PRIORITY_classes_presence700.tif"), overwrite=TRUE)
+
+# Polígonos por clase (1..3) → GPKG (capas separadas)
+for(k in 1:3){
+  rk <- cls == k
+  nk <- as.numeric(global(rk, "sum", na.rm=TRUE))
+  if(!is.na(nk) && nk > 0){
+    pk <- as.polygons(rk, dissolve=TRUE, values=TRUE, na.out=TRUE)
+    vcol <- names(pk)[1]
+    pk <- pk[ pk[[vcol]] == 1, ]
+    if(nrow(pk) > 0){
+      pk <- makeValid(pk); pk <- aggregate(pk)
+      writeVector(pk, sprintf("outputs/PRIORITY_classes_presence700.gpkg|layer=class_%d",k), overwrite=TRUE)
+    }
+  }
+}
+
+# Áreas por clase (km²)
+cell_km2_idx <- cellSize(cls, unit="km")
+area_by_cls <- sapply(0:3, function(k) as.numeric(global(cell_km2_idx * (cls==k), "sum", na.rm=TRUE)))
+area_tbl <- data.frame(class_id=0:3,
+                       class=c("Low/None","Medium (P50–P75)","High (P75–P90)","Critical (≥P90)"),
+                       area_km2=area_by_cls)
+write.csv(area_tbl, file.path("outputs","PRIORITY_classes_area_km2.csv"), row.names=FALSE)
+
+# ---------- 7) Resumen clave para manuscrito ----------
+resumen <- list(
+  presence_area_km2 = presence_area_km2,
+  hfp_weighted_mean = hfp_weighted_mean,
+  fixed_classes = area_fix
+)
+# extra: porcentajes de 3 niveles (para texto)
+write.csv(resumen$fixed_classes, file.path("outputs","resumen_hfp_vs_rana_thr700.csv"), row.names=FALSE)
+
+# ---------- 8) Exportar AOI de Yucatán para Global Forest Watch ----------
+if(file.exists(f_aoi)){
+  yuc <- vect(f_aoi) |> makeValid() |> aggregate()
+  if(is.na(crs(yuc)) || crs(yuc)!="EPSG:4326") yuc <- project(yuc, "EPSG:4326")
+  # Simplificar (reduce tamaño; conserva forma)
+  yuc_sf <- st_as_sf(yuc)
+  yuc_simp <- ms_simplify(yuc_sf, keep=0.10, keep_shapes=TRUE)
+  yuc_v <- vect(yuc_simp)
+  # Exportar
+  writeVector(yuc_v, file.path("outputs","yucatan_AOI.geojson"), overwrite=TRUE)
+  writeVector(yuc_v, file.path("outputs","yucatan_AOI.kml"), overwrite=TRUE)
+  writeVector(yuc_v, file.path("outputs","yucatan_AOI.shp"), overwrite=TRUE)
+  # Zipear Shapefile
+  shp_files <- list.files("outputs", pattern="^yucatan_AOI\\.(shp|shx|dbf|prj|cpg)$", full.names=TRUE, ignore.case=TRUE)
+  if(length(shp_files)) zip::zipr(file.path("outputs","yucatan_AOI_SHP.zip"), files=shp_files)
+}
+
+# ---------- 9) Guardar session info ----------
+sink(file.path("outputs","sessionInfo.txt")); print(sessionInfo()); sink()
+
+cat("\n✅ Listo. Archivos generados en ./outputs/\n")

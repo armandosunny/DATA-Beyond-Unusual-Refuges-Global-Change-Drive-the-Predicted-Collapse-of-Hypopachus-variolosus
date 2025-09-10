@@ -1,0 +1,147 @@
+###############################################
+# Hypopachus variolosus – análisis y figuras
+# Autor: (pon tu nombre)
+# Fecha: (pon la fecha)
+# Requiere: R ≥ 4.1, paquetes terra, ggplot2, dplyr, readr, RColorBrewer
+###############################################
+
+# ==== 0) Paquetes y utilidades ==== #
+pkgs <- c("terra","ggplot2","dplyr","readr","RColorBrewer")
+to_install <- pkgs[!pkgs %in% installed.packages()[,1]]
+if(length(to_install)) install.packages(to_install, dependencies = TRUE)
+lapply(pkgs, library, character.only = TRUE)
+set.seed(123)
+
+# Paleta colorblind-friendly (Okabe-Ito)
+okabe_ito <- c("#000000","#E69F00","#56B4E9","#009E73","#F0E442","#0072B2","#D55E00","#CC79A7")
+
+# ==== 1) Datos de área (km²) – Nacional y Estado de México ==== #
+# NOTA: Si necesitas añadir más escenarios o estados, agrega filas aquí.
+
+areas <- tibble::tribble(
+  ~Region,           ~Scenario,    ~Threshold, ~Area_km2,
+  "Mexico (national)","Present",    "700",      619304.62,
+  "Mexico (national)","Present",    "800",      164444.55,
+  "Mexico (national)","Future_RCP85_2050","700", 24391.65,
+  "Mexico (national)","Future_RCP85_2050","800", 932.93,
+
+  "State of Mexico", "Present",    "0",        22352.43,
+  "State of Mexico", "Present",    "700",      4255.04,
+  "State of Mexico", "Present",    "800",      141.67,
+  "State of Mexico", "Future_RCP85_2050","700", 17.02,
+  "State of Mexico", "Future_RCP85_2050","800", 0.00
+)
+
+# Guardar tabla para trazabilidad
+if(!dir.exists("outputs")) dir.create("outputs", recursive = TRUE)
+readr::write_csv(areas, "outputs/areas_summary.csv")
+
+# ==== 2) Gráfica de barras – Presente primero, luego Futuro ==== #
+# Nacional
+areas_nat <- areas %>% filter(Region == "Mexico (national)", Threshold %in% c("700","800"))
+areas_nat$Scenario <- factor(areas_nat$Scenario, levels = c("Present","Future_RCP85_2050"))
+
+p_nat <- ggplot(areas_nat, aes(x = Threshold, y = Area_km2, fill = Scenario)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65, color = "grey20") +
+  scale_fill_manual(values = okabe_ito[c(3,2)], labels = c("Present","Future (2050, RCP 8.5)")) +
+  scale_y_continuous(labels = scales::label_number(big.mark=",")) +
+  labs(title = "Suitable area in Mexico (national)",
+       subtitle = "Hypopachus variolosus • thresholds 700/800",
+       x = "Threshold", y = "Area (km²)", fill = "Scenario") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+ggsave("outputs/areas_mexico_bar.png", p_nat, width = 7, height = 5, dpi = 300)
+ggsave("outputs/areas_mexico_bar.pdf", p_nat, width = 7, height = 5)
+
+# Estado de México (mostrar 0/700/800 en presente y 700/800 en futuro)
+areas_edomex <- areas %>% filter(Region == "State of Mexico")
+areas_edomex$Scenario <- factor(areas_edomex$Scenario, levels = c("Present","Future_RCP85_2050"))
+
+p_edomex <- ggplot(areas_edomex, aes(x = Threshold, y = Area_km2, fill = Scenario)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65, color = "grey20") +
+  scale_fill_manual(values = okabe_ito[c(3,2)], labels = c("Present","Future (2050, RCP 8.5)")) +
+  scale_y_continuous(labels = scales::label_number(big.mark=",")) +
+  labs(title = "Suitable area in the State of Mexico",
+       subtitle = "Hypopachus variolosus • thresholds 0/700/800",
+       x = "Threshold", y = "Area (km²)", fill = "Scenario") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+ggsave("outputs/areas_state_of_mexico_bar.png", p_edomex, width = 7, height = 5, dpi = 300)
+ggsave("outputs/areas_state_of_mexico_bar.pdf", p_edomex, width = 7, height = 5)
+
+# ==== 3) Mapa: Elevación + ocurrencias CSV (paleta con cafés) ==== #
+# Ajusta el path a tu carpeta si es necesario
+# setwd("/Volumes/KINGSTON/ranitavaca")  # <- descomenta si usas ese volumen
+
+# Archivos esperados:
+# - Raster de elevación (e.g., "ALTITUDBIENMAXENT.asc")
+# - CSV de ocurrencias con columnas de coordenadas (e.g., decimalLongitude, decimalLatitude)
+elev_path   <- "ALTITUDBIENMAXENT.asc"
+occ_csv     <- "Filtered and cleaned occurrences_Hypopachus variolosus12000_20250818083751.csv"
+
+if(file.exists(elev_path) && file.exists(occ_csv)){
+  elev <- terra::rast(elev_path)
+
+  occ_df <- read.csv(occ_csv)
+  # Cambia estos nombres si tus campos se llaman distinto (p.ej. "lon","lat")
+  lon_col <- "decimalLongitude"
+  lat_col <- "decimalLatitude"
+  stopifnot(all(c(lon_col, lat_col) %in% names(occ_df)))
+
+  pts <- terra::vect(occ_df, geom = c(lon_col, lat_col), crs = "EPSG:4326")
+
+  # Paleta colorblind-friendly con cafés (Brewer BrBG)
+  pal_brbg <- colorRampPalette(RColorBrewer::brewer.pal(11, "BrBG"))(100)
+
+  png("outputs/elevation_occurrences.png", width = 1800, height = 1200, res = 200)
+  plot(elev, col = pal_brbg, main = "Occurrences of H. variolosus over a Mexico elevation map")
+  points(pts, col = "black", pch = 20, cex = 0.7)
+  dev.off()
+
+  pdf("outputs/elevation_occurrences.pdf", width = 9, height = 6)
+  plot(elev, col = pal_brbg, main = "Occurrences of H. variolosus over a Mexico elevation map")
+  points(pts, col = "black", pch = 20, cex = 0.7)
+  dev.off()
+} else {
+  message("Aviso: no se encontró elevación o CSV de ocurrencias. Revisa 'elev_path' y 'occ_csv'.")
+}
+
+# ==== 4) Utilidades opcionales para rásteres de idoneidad y umbrales ==== #
+# Si cuentas con rásteres continuos (0–1000) para Presente/Futuro, puedes crear mapas binarios
+# por umbral y un panel 2x2. Ajusta los nombres de archivos si los tienes.
+
+# Ejemplo de nombres (ajústalos a los tuyos o comenta si no los tienes):
+present_raster_path <- "present_suitability.tif"       # 0–1000
+future_raster_path  <- "future_suitability_rcp85.tif"  # 0–1000
+
+make_binary_by_threshold <- function(r, thr){
+  # r: SpatRaster continuo (0–1000); thr: umbral (700 u 800)
+  # Devuelve raster binario (1 = >= thr; NA = < thr)
+  x <- r
+  x[x < thr] <- NA
+  x[x >= thr] <- 1
+  return(x)
+}
+
+if(file.exists(present_raster_path) && file.exists(future_raster_path)){
+  r_p <- rast(present_raster_path)
+  r_f <- rast(future_raster_path)
+
+  b_p700 <- make_binary_by_threshold(r_p, 700)
+  b_p800 <- make_binary_by_threshold(r_p, 800)
+  b_f700 <- make_binary_by_threshold(r_f, 700)
+  b_f800 <- make_binary_by_threshold(r_f, 800)
+
+  png("outputs/panel_present_future_thresholds.png", width = 2400, height = 1600, res = 220)
+  par(mfrow = c(2,2), mar = c(4,4,3,6))
+  plot(b_p700, col = c(NA,"#2C7FB8"), main = "A) Present (≥700)")
+  plot(b_p800, col = c(NA,"#253494"), main = "B) Present (≥800)")
+  plot(b_f700, col = c(NA,"#E6550D"), main = "C) Future 2050 (≥700)")
+  plot(b_f800, col = c(NA,"#A63603"), main = "D) Future 2050 (≥800)")
+  dev.off()
+}
+
+# ==== 5) Info de sesión para reproducibilidad ==== #
+sink("outputs/sessionInfo.txt")
+print(sessionInfo())
+sink()
